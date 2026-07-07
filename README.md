@@ -6,6 +6,10 @@ A learning-oriented **C++ HTTP/1.1 static file server** built from scratch using
 
 ## 1. Project Overview
 
+### DEMO
+
+![Demo Video](ScreenRecording2026-07-08at12.05.36AM-ezgif.com-video-to-gif-converter.gif)
+
 This project implements a minimal but functional HTTP server that:
 
 - Listens on a TCP port (default **8001**)
