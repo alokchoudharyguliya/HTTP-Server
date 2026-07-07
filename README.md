@@ -8,7 +8,7 @@ A learning-oriented **C++ HTTP/1.1 static file server** built from scratch using
 
 ### DEMO
 
-![Demo Video](ScreenRecording2026-07-08at12.05.36AM-ezgif.com-video-to-gif-converter.gif)
+![Demo Video](Demo Video Screen Recording.gif)
 
 This project implements a minimal but functional HTTP server that:
 
