@@ -7,8 +7,7 @@ A learning-oriented **C++ HTTP/1.1 static file server** built from scratch using
 ## 1. Project Overview
 
 ### DEMO
-
-![Demo Video](Demo Video Screen Recording.gif)
+![Demo Video](Demo_Video_Screen_Recording.gif)
 
 This project implements a minimal but functional HTTP server that:
 
