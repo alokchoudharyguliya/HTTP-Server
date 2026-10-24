@@ -3,6 +3,17 @@
 #include <iostream>
 #include <stdlib.h>
 #include <string>
+#include<csignal>
+#include<sys/socket.h>
+volatile sig_atomic_t g_stop=0;
+int g_listenFd=-1;
+
+void onSigint(int){
+  g_stop=1;
+  if(g_listenFd>=0)
+  ::shutdown(g_listenFd, SHUT_RDWR);
+}
+
 int main(int argc, char *argv[]) {
   int port = 8001;
   std::string root = "public";
@@ -21,5 +32,6 @@ int main(int argc, char *argv[]) {
   if (argc >= 3)
     root = argv[2];
   HTTPServer server(port, root);
+  std::signal(SIGINT, onSigint);
   server.start();
 }

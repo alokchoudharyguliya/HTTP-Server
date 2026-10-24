@@ -22,6 +22,8 @@ class Socket{
 		ssize_t receive(void*buffer, size_t length);
 		void close();
 		bool isValid()const;
+		int fd() const;
+		void setReceiveTimeout(int seconds);
 	private:
 		int socketFd_;
 };

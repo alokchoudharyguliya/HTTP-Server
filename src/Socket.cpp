@@ -65,9 +65,9 @@ ssize_t Socket::send(const void *buffer, size_t length) {
         continue;
       return -1;
     }
-    if (n==0)
-    return -1;
-  sentTotal+=static_cast<size_t>(n);
+    if (n == 0)
+      return -1;
+    sentTotal += static_cast<size_t>(n);
   }
   return static_cast<ssize_t>(sentTotal);
 }
@@ -89,6 +89,14 @@ bool Socket::isValid() const { return socketFd_ != -1; }
 void Socket::setReuseAddress(bool enable) {
   int opt = enable ? 1 : 0;
   ::setsockopt(socketFd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+}
+
+int Socket::fd() const { return socketFd_; }
+
+void Socket::setReceiveTimeout(int seconds) {
+  timeval tv{};
+  tv.tv_sec = seconds;
+  ::setsockopt(socketFd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
 // Every HTTP Request header ends with \r\n\r\n

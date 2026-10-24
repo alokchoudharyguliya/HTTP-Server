@@ -9,6 +9,10 @@
 #include <sys/socket.h>
 #include <thread>
 #include <utility>
+#include <csignal>
+
+extern volatile sig_atomic_t g_stop;
+extern int g_listenFd;
 // class HTTPServer{
 // 	private:
 // 		FileServer fs_;
@@ -63,19 +67,26 @@ void HTTPServer::start() {
   Logger::info("  Workers       : 8");
   Logger::info("Listening on port " + std::to_string(port_));
   listener_.listen();
+  g_listenFd=listener_.fd();
+  
   std::cout << "Server is listening on port " << port_ << "\n";
-  while (true) {
+  // while (true) {
+  while(!g_stop){
     // std::cout << "Waiting for a client\n";
     // Logger::debug("Waiting for a client");
     Socket client = listener_.accept();
     // std::cout << "Client Connected\n";
+    if(!client.isValid()||g_stop)
+    break;
     Logger::debug("Client Connected");
     // std::thread(&HTTPServer::handleClient,this,std::move(client)).detach();
+    client.setReceiveTimeout(2);
     Task task([this, client = std::move(client)]() mutable {
       handleClient(std::move(client));
     });
     threadPool_.submit(std::move(task));
   }
+  listener_.close();
 }
 // void HTTPServer::handleClient(Socket client) {
 //   char buffer[4097];
@@ -144,7 +155,18 @@ void HTTPServer::handleClient(Socket client) {
       // recv() append into requestBuffer;
       ssize_t bytesReceived = client.receive(buffer, sizeof(buffer) - 1);
       // } else {
-      if (bytesReceived <= 0) {
+      // if (bytesReceived <= 0) {
+      //   Logger::debug("Client Disconnected");
+      //   return;
+      // }
+
+      if (bytesReceived < 0) {
+        if ((errno == EAGAIN || errno == EWOULDBLOCK) && !g_stop)
+          continue;
+        Logger::debug("Client Disconnected");
+        return;
+      }
+      if (bytesReceived == 0) {
         Logger::debug("Client Disconnected");
         return;
       }
