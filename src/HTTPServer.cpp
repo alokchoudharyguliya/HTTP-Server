@@ -179,10 +179,15 @@ void HTTPServer::handleClient(Socket client) {
     // response.headers["Content-Type"]="text/html";
     response.headers["Content-Type"] = MimeResolver::getMime(filePath);
     response.headers["Content-Length"] = std::to_string(response.body.size());
+    response.headers["Connection"]="close";
     //   response.headers["Connection"] = "close";
     std::string rawResponse = response.serialize();
-    client.send(rawResponse.c_str(), rawResponse.size());
-    requestBuffer.clear();
+    if(client.send(rawResponse.c_str(), rawResponse.size())<0){
+      Logger::error("Failed to send response");
+      return;
+    }
+
+    requestBuffer.clear(); 
     //   if(request.headers["Connection"] == "close")
     //   response.headers["Connection"]="close";
     // else
@@ -196,5 +201,6 @@ void HTTPServer::handleClient(Socket client) {
     for (const auto &header : request.headers)
       std::cout << header.first << "<" << header.second << "\n";
     // }
+    break;
   }
 }

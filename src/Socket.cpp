@@ -56,7 +56,20 @@ ssize_t Socket::receive(void *buffer, size_t length) {
   return recv(socketFd_, buffer, length, 0);
 }
 ssize_t Socket::send(const void *buffer, size_t length) {
-  return ::send(socketFd_, buffer, length, 0);
+  const char *data = static_cast<const char *>(buffer);
+  size_t sentTotal = 0;
+  while (sentTotal < length) {
+    ssize_t n = ::send(socketFd_, data + sentTotal, length - sentTotal, 0);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    if (n==0)
+    return -1;
+  sentTotal+=static_cast<size_t>(n);
+  }
+  return static_cast<ssize_t>(sentTotal);
 }
 Socket::Socket(Socket &&other) noexcept : socketFd_(other.socketFd_) {
   other.socketFd_ = -1;
