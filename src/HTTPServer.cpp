@@ -133,6 +133,7 @@ void HTTPServer::handleClient(Socket client) {
   char buffer[4097];
   std::string requestBuffer;
   while (true) {
+    bool shouldClose = false;
     auto start = std::chrono::high_resolution_clock::now();
     ssize_t headerEnd = requestBuffer.find("\r\n\r\n");
     while (headerEnd == std::string::npos) // while (request not complete) {
@@ -150,9 +151,11 @@ void HTTPServer::handleClient(Socket client) {
       requestBuffer.append(buffer, bytesReceived);
       // parse();
       // HTTPRequest request = parser_.parse(buffer);
-      headerEnd=requestBuffer.find("\r\n\r\n");
+      headerEnd = requestBuffer.find("\r\n\r\n");
     }
-    HTTPRequest request = parser_.parse(requestBuffer);
+    const size_t consumed=static_cast<size_t>(headerEnd)+4;
+    HTTPRequest request = parser_.parse(requestBuffer.substr(0,consumed));
+    requestBuffer.erase(0,consumed);
     Logger::debug("Request: " + request.method + " " + request.path + " " +
                   request.version);
 
@@ -179,28 +182,39 @@ void HTTPServer::handleClient(Socket client) {
     // response.headers["Content-Type"]="text/html";
     response.headers["Content-Type"] = MimeResolver::getMime(filePath);
     response.headers["Content-Length"] = std::to_string(response.body.size());
-    response.headers["Connection"]="close";
+    std::string connection = request.headers["Connection"];
+    if (connection.find("close") != std::string::npos)
+      shouldClose = true;
+    else if (request.version == "HTTP/1.0" &&
+             connection.find("keep-alive") == std::string::npos)
+      shouldClose = true;
+    if (shouldClose) {
+      response.headers["Connection"] = "close";
+    } else
+      response.headers["Connection"] = "keep-alive";
     //   response.headers["Connection"] = "close";
     std::string rawResponse = response.serialize();
-    if(client.send(rawResponse.c_str(), rawResponse.size())<0){
+    if (client.send(rawResponse.c_str(), rawResponse.size()) < 0) {
       Logger::error("Failed to send response");
       return;
     }
 
-    requestBuffer.clear(); 
+    
+    // requestBuffer.clear(); // Don't wipe the buffer, drops bytes that already arrived
     //   if(request.headers["Connection"] == "close")
     //   response.headers["Connection"]="close";
     // else
     // response.headers["Connection"]="keep-alive";
     auto end = std::chrono::high_resolution_clock::now();
     auto duration =
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
+    std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
     Logger::access(request, response, duration.count());
     std::cout << buffer << "\n";
     for (const auto &header : request.headers)
-      std::cout << header.first << "<" << header.second << "\n";
+    std::cout << header.first << "<" << header.second << "\n";
+    if (shouldClose)
+      break;
     // }
-    break;
   }
 }
