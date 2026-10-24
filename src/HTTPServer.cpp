@@ -4,6 +4,7 @@
 #include "MimeResolver.h"
 #include <chrono>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
@@ -153,9 +154,9 @@ void HTTPServer::handleClient(Socket client) {
       // HTTPRequest request = parser_.parse(buffer);
       headerEnd = requestBuffer.find("\r\n\r\n");
     }
-    const size_t consumed=static_cast<size_t>(headerEnd)+4;
-    HTTPRequest request = parser_.parse(requestBuffer.substr(0,consumed));
-    requestBuffer.erase(0,consumed);
+    const size_t consumed = static_cast<size_t>(headerEnd) + 4;
+    HTTPRequest request = parser_.parse(requestBuffer.substr(0, consumed));
+    requestBuffer.erase(0, consumed);
     Logger::debug("Request: " + request.method + " " + request.path + " " +
                   request.version);
 
@@ -170,9 +171,14 @@ void HTTPServer::handleClient(Socket client) {
     else
       filePath = documentRoot_ + request.path;
     HTTPResponse response;
-    if (fs_.exists(filePath))
-      response.body = fs_.readFile(filePath);
-    else {
+    bool streamFile = false;
+    std::ifstream file;
+    if (fs_.exists(filePath)) {
+      // response.body = fs_.readFile(filePath);
+      file = fs_.openBinary(filePath);
+      streamFile = file.is_open();
+    }
+    if (!streamFile) {
       response.statusCode = 404;
       response.reasonPhrase = "Not Found";
       response.body = "<h1>404 Not Found</h1>";
@@ -181,7 +187,7 @@ void HTTPServer::handleClient(Socket client) {
 
     // response.headers["Content-Type"]="text/html";
     response.headers["Content-Type"] = MimeResolver::getMime(filePath);
-    response.headers["Content-Length"] = std::to_string(response.body.size());
+    // response.headers["Content-Length"] = std::to_string(response.body.size());
     std::string connection = request.headers["Connection"];
     if (connection.find("close") != std::string::npos)
       shouldClose = true;
@@ -193,26 +199,67 @@ void HTTPServer::handleClient(Socket client) {
     } else
       response.headers["Connection"] = "keep-alive";
     //   response.headers["Connection"] = "close";
-    std::string rawResponse = response.serialize();
-    if (client.send(rawResponse.c_str(), rawResponse.size()) < 0) {
-      Logger::error("Failed to send response");
-      return;
+    if (!streamFile) {
+      response.headers["Content-Length"] = std::to_string(response.body.size());
+      std::string rawResponse = response.serialize();
+      if (client.send(rawResponse.c_str(), rawResponse.size()) < 0) {
+        Logger::error("Failed to send response");
+        return;
+      }
+    } else {
+      response.headers["Transfer-Encoding"] = "chunked";
+      std::string rawHeaders = response.serializeHeaders();
+      if (client.send(rawHeaders.c_str(), rawHeaders.size()) < 0) {
+        Logger::error("Failed to send response");
+        return;
+      }
+      char fileBuffer[4096];
+      while (file) {
+        file.read(fileBuffer, sizeof(fileBuffer));
+        std::streamsize n = file.gcount();
+        if (n <= 0)
+          break;
+        std::ostringstream sizeLine;
+        sizeLine << std::hex << n << "\r\n";
+        std::string sizeHeader = sizeLine.str();
+        if (client.send(sizeHeader.c_str(), sizeHeader.size()) < 0 ||
+            client.send(fileBuffer, static_cast<size_t>(n)) < 0) {
+          Logger::error("Failed to send response");
+          return;
+        }
+        const char crlf[] = "\r\n";
+        if (client.send(crlf, 2) < 0) {
+          Logger::error("Failed to send response");
+          return;
+        }
+      }
+      const char terminator[] = "0\r\n\r\n";
+      if (client.send(terminator, 5) < 0) {
+        Logger::error("Failed to send response");
+        return;
+      }
     }
 
-    
-    // requestBuffer.clear(); // Don't wipe the buffer, drops bytes that already arrived
+    // std::string rawResponse = response.serialize();
+    // if (client.send(rawResponse.c_str(), rawResponse.size()) < 0) {
+    //   Logger::error("Failed to send response");
+    //   return;
+    // }
+
+    // requestBuffer.clear(); // Don't wipe the buffer, drops bytes that already
+    // arrived
     //   if(request.headers["Connection"] == "close")
     //   response.headers["Connection"]="close";
     // else
     // response.headers["Connection"]="keep-alive";
     auto end = std::chrono::high_resolution_clock::now();
     auto duration =
-    std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-    
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
     Logger::access(request, response, duration.count());
     std::cout << buffer << "\n";
     for (const auto &header : request.headers)
-    std::cout << header.first << "<" << header.second << "\n";
+      std::cout << header.first << "<" << header.second << "\n";
     if (shouldClose)
       break;
     // }

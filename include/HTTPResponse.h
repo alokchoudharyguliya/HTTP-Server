@@ -8,4 +8,5 @@ class HTTPResponse{
 		std::unordered_map<std::string,std::string>headers;
 		std::string body;
 		std::string serialize() const;
+		std::string serializeHeaders() const;
 };

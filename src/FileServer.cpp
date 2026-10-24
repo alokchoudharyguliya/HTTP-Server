@@ -19,3 +19,6 @@ std::string FileServer::readFile(const std::string &path) {
                           // string
   return buffer.str();
 }
+std::ifstream FileServer::openBinary(const std::string&path){
+  return std::ifstream(path, std::ios::binary);
+}
