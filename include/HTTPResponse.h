@@ -9,4 +9,7 @@ class HTTPResponse{
 		std::string body;
 		std::string serialize() const;
 		std::string serializeHeaders() const;
+		static std::string formatChunk(const std::string&data);
+		static std::string chunkTerminator();
 };
+

@@ -3,13 +3,14 @@
 #include "Logger.h"
 #include "MimeResolver.h"
 #include <chrono>
+#include <csignal>
+#include <filesystem>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
 #include <thread>
 #include <utility>
-#include <csignal>
-
+namespace fs = std::filesystem;
 extern volatile sig_atomic_t g_stop;
 extern int g_listenFd;
 // class HTTPServer{
@@ -66,16 +67,16 @@ void HTTPServer::start() {
   Logger::info("  Workers       : 8");
   Logger::info("Listening on port " + std::to_string(port_));
   listener_.listen();
-  g_listenFd=listener_.fd();
-  
+  g_listenFd = listener_.fd();
+
   // while (true) {
-  while(!g_stop){
+  while (!g_stop) {
     // std::cout << "Waiting for a client\n";
     // Logger::debug("Waiting for a client");
     Socket client = listener_.accept();
     // std::cout << "Client Connected\n";
-    if(!client.isValid()||g_stop)
-    break;
+    if (!client.isValid() || g_stop)
+      break;
     Logger::debug("Client Connected");
     // std::thread(&HTTPServer::handleClient,this,std::move(client)).detach();
     client.setReceiveTimeout(2);
@@ -190,15 +191,28 @@ void HTTPServer::handleClient(Socket client) {
       filePath = documentRoot_ + "/index.html";
     else
       filePath = documentRoot_ + request.path;
+    fs::path root = fs::weakly_canonical(documentRoot_);
+    fs::path resolved = fs::weakly_canonical(filePath);
+    std::string rootText = root.string();
+    if (!rootText.empty() && rootText.back() != '/')
+      rootText.push_back('/');
+    bool insideRoot =
+        resolved == root || resolved.string().starts_with(rootText);
+
     HTTPResponse response;
     bool streamFile = false;
     std::ifstream file;
-    if (fs_.exists(filePath)) {
+    if (insideRoot && fs_.exists(filePath)) {
       // response.body = fs_.readFile(filePath);
       file = fs_.openBinary(filePath);
       streamFile = file.is_open();
     }
-    if (!streamFile) {
+    if (!insideRoot) {
+      response.statusCode = 403;
+      response.reasonPhrase = "Forbidden";
+      response.body = "<h1>403 Forbidden</h1>";
+      Logger::warning("Rejected path outside the document root: " + filePath);
+    } else if (!streamFile) {
       response.statusCode = 404;
       response.reasonPhrase = "Not Found";
       response.body = "<h1>404 Not Found</h1>";
@@ -207,7 +221,8 @@ void HTTPServer::handleClient(Socket client) {
 
     // response.headers["Content-Type"]="text/html";
     response.headers["Content-Type"] = MimeResolver::getMime(filePath);
-    // response.headers["Content-Length"] = std::to_string(response.body.size());
+    // response.headers["Content-Length"] =
+    // std::to_string(response.body.size());
     std::string connection = request.headers["Connection"];
     if (connection.find("close") != std::string::npos)
       shouldClose = true;
@@ -239,16 +254,19 @@ void HTTPServer::handleClient(Socket client) {
         std::streamsize n = file.gcount();
         if (n <= 0)
           break;
-        std::ostringstream sizeLine;
-        sizeLine << std::hex << n << "\r\n";
-        std::string sizeHeader = sizeLine.str();
-        if (client.send(sizeHeader.c_str(), sizeHeader.size()) < 0 ||
+        // std::ostringstream sizeLine;
+        // sizeLine << std::hex << n << "\r\n";
+        // std::string sizeHeader = sizeLine.str();
+        std::string chunk=HTTPResponse::formatChunk(std::string(fileBuffer, static_cast<size_t>(n)));
+        if (client.send(chunk.c_str(), chunk.size()) < 0 ||
             client.send(fileBuffer, static_cast<size_t>(n)) < 0) {
           Logger::error("Failed to send response");
           return;
         }
-        const char crlf[] = "\r\n";
-        if (client.send(crlf, 2) < 0) {
+        // const char crlf[] = "\r\n";
+        // if (client.send(crlf, 2) < 0) {
+        std::string terminator=HTTPResponse::chunkTerminator();
+        if(client.send(terminator.c_str(),terminator.size())<0){
           Logger::error("Failed to send response");
           return;
         }

@@ -19,3 +19,11 @@ std::string HTTPResponse::serializeHeaders() const {
 	response<<"\r\n";
 	return response.str();
 }
+std::string HTTPResponse::formatChunk(const std::string&data){
+  std::ostringstream out;
+  out<<std::hex<<data.size()<<"\r\n"<<data<<"\r\n";
+  return out.str();
+}
+std::string HTTPResponse::chunkTerminator(){
+  return "0\r\n\r\n";
+}
