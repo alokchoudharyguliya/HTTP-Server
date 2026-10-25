@@ -22,7 +22,7 @@ public:
   static void warning(const std::string &message);
   static void error(const std::string &message);
   static void access(const HTTPRequest &request, const HTTPResponse &response,
-                     long long latencyMs); // renamed log to access
+                     long long latencyMs, size_t bytesSent); // renamed log to access
   static void setLevel(Level level);
   static void setLevelFromString(const std::string &level);
 };

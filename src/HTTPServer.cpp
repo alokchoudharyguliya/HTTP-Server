@@ -202,6 +202,8 @@ void HTTPServer::handleClient(Socket client) {
     HTTPResponse response;
     bool streamFile = false;
     std::ifstream file;
+    size_t bytesSent = 0;
+
     if (insideRoot && fs_.exists(filePath)) {
       // response.body = fs_.readFile(filePath);
       file = fs_.openBinary(filePath);
@@ -211,11 +213,14 @@ void HTTPServer::handleClient(Socket client) {
       response.statusCode = 403;
       response.reasonPhrase = "Forbidden";
       response.body = "<h1>403 Forbidden</h1>";
+      bytesSent = response.body.size();
+
       Logger::warning("Rejected path outside the document root: " + filePath);
     } else if (!streamFile) {
       response.statusCode = 404;
       response.reasonPhrase = "Not Found";
       response.body = "<h1>404 Not Found</h1>";
+      bytesSent = response.body.size();
       Logger::warning("File not found: " + filePath);
     }
 
@@ -234,6 +239,7 @@ void HTTPServer::handleClient(Socket client) {
     } else
       response.headers["Connection"] = "keep-alive";
     //   response.headers["Connection"] = "close";
+
     if (!streamFile) {
       response.headers["Content-Length"] = std::to_string(response.body.size());
       std::string rawResponse = response.serialize();
@@ -257,25 +263,28 @@ void HTTPServer::handleClient(Socket client) {
         // std::ostringstream sizeLine;
         // sizeLine << std::hex << n << "\r\n";
         // std::string sizeHeader = sizeLine.str();
-        std::string chunk=HTTPResponse::formatChunk(std::string(fileBuffer, static_cast<size_t>(n)));
-        if (client.send(chunk.c_str(), chunk.size()) < 0 ||
-            client.send(fileBuffer, static_cast<size_t>(n)) < 0) {
+        bytesSent += static_cast<size_t>(n);
+        std::string chunk = HTTPResponse::formatChunk(
+            std::string(fileBuffer, static_cast<size_t>(n)));
+        if (client.send(chunk.c_str(), chunk.size()) < 0
+            // || client.send(fileBuffer, static_cast<size_t>(n)) < 0
+        ) {
           Logger::error("Failed to send response");
           return;
         }
         // const char crlf[] = "\r\n";
         // if (client.send(crlf, 2) < 0) {
-        std::string terminator=HTTPResponse::chunkTerminator();
-        if(client.send(terminator.c_str(),terminator.size())<0){
-          Logger::error("Failed to send response");
-          return;
-        }
       }
-      const char terminator[] = "0\r\n\r\n";
-      if (client.send(terminator, 5) < 0) {
+      std::string terminator = HTTPResponse::chunkTerminator();
+      if (client.send(terminator.c_str(), terminator.size()) < 0) {
         Logger::error("Failed to send response");
         return;
       }
+      // const char terminator[] = "0\r\n\r\n";
+      // if (client.send(terminator, 5) < 0) {
+      // Logger::error("Failed to send response");
+      // return;
+      // }
     }
 
     // std::string rawResponse = response.serialize();
@@ -294,10 +303,11 @@ void HTTPServer::handleClient(Socket client) {
     auto duration =
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-    Logger::access(request, response, duration.count());
+    Logger::access(request, response, duration.count(), bytesSent);
     Logger::debug(std::string("Raw buffer: ") + buffer);
     for (const auto &header : request.headers)
-      std::cout << header.first << "<" << header.second << "\n";
+      // std::cout << header.first << "<" << header.second << "\n";
+      Logger::debug(header.first + "<" + header.second + "\n");
     if (shouldClose)
       break;
     // }

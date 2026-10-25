@@ -16,11 +16,12 @@ std::string Logger::currentTimestamp() {
 }
 
 void Logger::access(const HTTPRequest &request, const HTTPResponse &response,
-                    long long latencyMs) { // was earlier log
+                    long long latencyMs, size_t bytesSent) { // was earlier log
   std::lock_guard<std::mutex> lock(Logger::mutex_);
   std::cerr << prefix("ACCESS") << request.method << " " << request.path << "->"
             << response.statusCode << "\t"
-            << " | " << response.body.size() << " B "
+            // << " | " << response.body.size() << " B "
+            << " | " << bytesSent << " B "
             << " | " << latencyMs << "\n";
 }
 void Logger::info(const std::string &message) {
