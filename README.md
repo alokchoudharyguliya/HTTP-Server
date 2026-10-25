@@ -265,7 +265,7 @@ LOG_LEVEL=error ./build/http_server # errors and access lines
 
 The debug lines in the example appear only when `LOG_LEVEL=debug`. The access size is `response.body.size()`, which is `0` for a chunked file response.
 
-**Example output (`LOG_LEVEL=debug`):**
+**Example output (**`LOG_LEVEL=debug`**):**
 
 ```
 [2026-07-07 23:26:00] [INFO] Listening on port 8001
@@ -486,9 +486,9 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 - [x] Skip invalid sockets after failed `accept()` (`!client.isValid()`)
 - [x] Route remaining `std::cout` debug output through `Logger`
 - [x] Configurable log level (e.g. `LOG_LEVEL=debug`)
-- [ ] Path normalization / traversal protection
-- [ ] Unit tests for response serialization and chunk framing
-- [ ] Trim header values and accept `\r\n` line endings in `HTTPParser`
+- [x] Path normalization / traversal protection
+- [x] Unit tests for response serialization and chunk framing
+- [x] Trim header values and accept `\r\n` line endings in `HTTPParser`
 - [ ] Count streamed bytes in the access log
 - [ ] Benchmark your existing server — establish throughput and tail-latency baselines.
 - [ ] Implement a kqueue-based event loop — start with non-blocking accept and read operations.
