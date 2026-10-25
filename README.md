@@ -7,6 +7,7 @@ A learning-oriented **C++ HTTP/1.1 static file server** built from scratch using
 ## 1. Project Overview
 
 ### DEMO
+
 ![Demo Video](Demo_Video_Screen_Recording.gif)
 
 This project implements a minimal but functional HTTP server that:
@@ -15,17 +16,24 @@ This project implements a minimal but functional HTTP server that:
 - Accepts incoming client connections
 - Parses HTTP/1.1 GET requests
 - Serves static files from the `public/` directory
-- Returns proper status codes, MIME types, and `Content-Length`
+- Streams file bodies with `Transfer-Encoding: chunked` (404 responses use `Content-Length`)
+- Keeps HTTP/1.1 connections open unless the client sends `Connection: close`
 - Handles multiple clients concurrently using a **thread pool**
+- Stops accepting new connections on Ctrl+C and joins the worker threads
 - Logs events and requests with timestamps, levels, status, size, and latency
 
 It was evolved from a single-file prototype into a multi-module C++17 codebase, demonstrating networking, HTTP basics, RAII, and concurrent programming.
 
 ### Recent improvements
 
-- **Logger** — level-based, mutex-protected logging across all modules
-- **`\r\n\r\n` framing** — incremental request reads until headers are complete
-- **`SO_REUSEADDR`** — immediate port reuse on server restart
+- **Keep-alive** — one worker serves repeated requests on the same socket and preserves bytes already read past the current request
+- **Chunked responses** — file bodies are read and sent in fixed-size buffers with a terminating `0` chunk
+- **Full writes** — `Socket::send()` loops until the whole buffer is written
+- **Graceful shutdown** — SIGINT sets a flag, unblocks `accept()`, and lets idle workers exit on a receive timeout
+- **Parser tests** — GoogleTest covers `HTTPParser` without opening a socket
+- **Logger** — level-based, mutex-protected logging. `LOG_LEVEL` selects `debug`, `info` (the default), `warning`, or `error`. Access lines are always printed.
+- `\r\n\r\n` **framing** — incremental request reads until headers are complete
+- `SO_REUSEADDR` — immediate port reuse on server restart
 
 ---
 
@@ -59,15 +67,16 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
 1. **Main thread** blocks on `listener_.accept()` waiting for a client.
 2. Accepted `Socket` is moved into a **packaged task** and submitted to the **ThreadPool** (8 workers).
 3. Worker runs `handleClient()`:
-  - `recv()` into a buffer, appending to `requestBuffer` until `\r\n\r\n` is found
-  - `HTTPParser` parses method, path, version, headers
-  - Map path → file under `public/`
-  - `FileServer` reads file or returns 404
-  - `MimeResolver` sets `Content-Type`
-  - `HTTPResponse::serialize()` builds raw HTTP response
-  - `Socket::send()` writes response to client
-  - `Logger::access()` records the transaction
-4. Loop continues for keep-alive (multiple requests per connection until client closes).
+   - `recv()` into a buffer, appending to `requestBuffer` until `\r\n\r\n` is found. A 2-second timeout with no data keeps the connection open.
+   - Only the bytes up to that delimiter are parsed. Anything after them stays in `requestBuffer` for the next request.
+   - `HTTPParser` parses method, path, version, headers
+   - Map path → file under `public/`
+   - A found file is opened in binary mode and sent as chunked data. A missing file is a small in-memory 404 with `Content-Length`.
+   - `MimeResolver` sets `Content-Type`
+   - `Connection` is `close` when the client asked for it, or when the request is HTTP/1.0 without `keep-alive`. Otherwise it is `keep-alive`.
+   - `Socket::send()` writes every byte of the headers and each chunk
+   - `Logger::access()` records the transaction
+4. The worker loops for another request on the same connection unless `Connection: close` was chosen, the client disconnected, or shutdown was requested.
 
 ---
 
@@ -96,6 +105,8 @@ http-server/
 │   ├── MimeResolver.cpp
 │   ├── Logger.cpp
 │   └── ThreadPool.cpp
+├── tests/
+│   └── parser_test.cpp     # GoogleTest cases for HTTPParser
 ├── public/                 # Web root (served files)
 │   ├── index.html
 │   ├── abc.css
@@ -119,11 +130,13 @@ Wraps POSIX socket APIs with resource-safe ownership.
 | `listen()`           | `listen()`                    | Start listening                          |
 | `accept()`           | `accept()`                    | Accept client connection                 |
 | `receive()`          | `recv()`                      | Read bytes                               |
-| `send()`             | `send()`                      | Write bytes                              |
+| `send()`             | `send()` in a loop            | Write every byte, retrying on `EINTR`    |
 | `close()`            | `close()`                     | Close FD safely                          |
+| `fd()`               | —                             | Listening descriptor used to wake `accept()` |
+| `setReceiveTimeout()`| `setsockopt(SO_RCVTIMEO)`     | Bound how long a worker blocks in `recv()` |
 | `setReuseAddress()`  | `setsockopt(SO_REUSEADDR)`    | Allow immediate port reuse after restart |
 
-**`SO_REUSEADDR`**
+`SO_REUSEADDR`
 
 Before `bind()`, the server calls `setReuseAddress(true)`, which sets `SO_REUSEADDR` via `setsockopt()`. This lets the process re-bind to the same port immediately after restart, instead of waiting for the OS to release the socket in `TIME_WAIT`.
 
@@ -141,7 +154,7 @@ void Socket::setReuseAddress(bool enable) {
 - **RAII** — destructor closes the FD
 - **Move-only type** — copy deleted; move transfers ownership
 - **File descriptors** — integer handles to OS resources
-- **`SO_REUSEADDR`** — socket option for fast server restarts during development
+- `SO_REUSEADDR` — socket option for fast server restarts during development
 
 ---
 
@@ -157,16 +170,21 @@ void Socket::setReuseAddress(bool enable) {
 
 - `statusCode`, `reasonPhrase`
 - `headers`, `body`
-- `serialize()` — builds wire-format HTTP/1.1 response
+- `serialize()` — status line, headers, blank line, and `body` (used for 404)
+- `serializeHeaders()` — the same block without `body` (used before chunked file data)
 
-Example serialized output:
+A file response does not set `Content-Length`. It sets `Transfer-Encoding: chunked` and then sends each chunk as hexadecimal size, bytes, and `\r\n`, ending with `0\r\n\r\n`.
 
 ```http
 HTTP/1.1 200 OK
 Content-Type: text/html
-Content-Length: 225
+Transfer-Encoding: chunked
+Connection: keep-alive
 
+e1
 <!DOCTYPE html>...
+0
+
 ```
 
 ---
@@ -188,7 +206,8 @@ Parses a raw request string into `HTTPRequest`:
 Serves files from disk:
 
 - `exists(path)` — `std::filesystem::exists`
-- `readFile(path)` — reads entire file into `std::string`
+- `readFile(path)` — reads an entire file into `std::string` (kept for small in-memory reads)
+- `openBinary(path)` — returns a binary `ifstream` the caller owns. `handleClient` reads that stream in 4096-byte pieces so a large file is not held as one string. The stream is not stored on `FileServer`, because every worker shares one `FileServer`.
 
 Path mapping in `HTTPServer`:
 
@@ -227,13 +246,32 @@ Thread-safe, level-based logging used across the server (`HTTPServer`, `Socket`,
 
 All output goes to **stderr** with a timestamped prefix and is protected by a static `std::mutex`.
 
-**Example output:**
+`main` reads `LOG_LEVEL` before the server starts and passes it to `Logger::setLevelFromString`. The cutoff defaults to `info`. A message is printed when its severity is at least that cutoff: `debug` is the lowest, then `info`, `warning`, and `error`. An unknown value keeps `info` and logs a warning.
+
+| `LOG_LEVEL` | What is printed                                      |
+| ----------- | ---------------------------------------------------- |
+| `debug`     | debug, info, warning, error, and every access line   |
+| `info`      | info, warning, error, and every access line (default)|
+| `warning`   | warning, error, and every access line                |
+| `error`     | error and every access line                          |
+
+`access()` does not consult the cutoff. Request lines stay visible even when `LOG_LEVEL=error`.
+
+```bash
+./build/http_server                  # info and above
+LOG_LEVEL=debug ./build/http_server # include debug lines
+LOG_LEVEL=error ./build/http_server # errors and access lines
+```
+
+The debug lines in the example appear only when `LOG_LEVEL=debug`. The access size is `response.body.size()`, which is `0` for a chunked file response.
+
+**Example output (`LOG_LEVEL=debug`):**
 
 ```
 [2026-07-07 23:26:00] [INFO] Listening on port 8001
 [2026-07-07 23:26:05] [DEBUG] Client Connected
 [2026-07-07 23:26:05] [DEBUG] Request: GET /file.jpeg HTTP/1.1
-[2026-07-07 23:26:05] [ACCESS] GET /file.jpeg->200	 | 26363 B  | 2
+[2026-07-07 23:26:05] [ACCESS] GET /file.jpeg->200	 | 0 B  | 2
 [2026-07-07 23:26:05] [WARNING] File not found: public/missing.html
 [2026-07-07 23:26:05] [ERROR] Failed to accept client: Too many open files
 ```
@@ -287,16 +325,14 @@ HTTPServer::HTTPServer(int port, const std::string& root)
 HTTP headers end with a blank line: `\r\n\r\n`. The server no longer assumes a single `recv()` returns a complete request. Instead, `handleClient()` accumulates bytes into `requestBuffer` until that delimiter is found:
 
 ```cpp
-ssize_t headerEnd = requestBuffer.find("\r\n\r\n");
-while (headerEnd == std::string::npos) {
-  ssize_t bytesReceived = client.receive(buffer, sizeof(buffer) - 1);
-  if (bytesReceived <= 0)
-    return;  // client disconnected
-  requestBuffer.append(buffer, bytesReceived);
-  headerEnd = requestBuffer.find("\r\n\r\n");  // re-check after each read
-}
-HTTPRequest request = parser_.parse(requestBuffer);
+const size_t consumed = static_cast<size_t>(headerEnd) + 4;
+HTTPRequest request = parser_.parse(requestBuffer.substr(0, consumed));
+requestBuffer.erase(0, consumed);
 ```
+
+One `recv()` can contain the end of this request and the start of the next. Parsing only the first request and erasing those bytes leaves the remainder for the next loop. Clearing the whole buffer would drop that second request.
+
+A `recv()` of `-1` with `EAGAIN` or `EWOULDBLOCK` is the receive timeout, not a disconnect. The worker waits again unless shutdown has been requested. A return of `0` means the client closed the connection.
 
 **Why this matters:**
 
@@ -312,14 +348,15 @@ HTTPRequest request = parser_.parse(requestBuffer);
 | Category            | Concepts                                                                          |
 | ------------------- | --------------------------------------------------------------------------------- |
 | **Networking**      | TCP sockets, `bind`/`listen`/`accept`, `SO_REUSEADDR`, client-server model        |
-| **HTTP**            | Request line, headers, `\r\n\r\n` framing, status codes, `Content-Type`, keep-alive |
+| **HTTP**            | Request line, headers, `\r\n\r\n` framing, keep-alive, chunked transfer encoding |
 | **C++ OOP**         | Class separation, header/source split, static methods                             |
 | **RAII**            | `Socket` auto-closes on destruction                                               |
 | **Move semantics**  | Move-only `Socket`, `packaged_task`, initializer lists                            |
 | **Concurrency**     | Thread pool, detached vs pooled threads, shared resources                         |
 | **Synchronization** | `mutex`, `condition_variable`, `lock_guard`, `unique_lock`                        |
 | **Observability**   | Level-based logging, access logs, latency measurement                             |
-| **Build system**    | CMake, manual `clang++` compilation, linker errors (undefined symbols)            |
+| **Build system**    | CMake library plus server binary, GoogleTest via FetchContent                     |
+| **Process control** | SIGINT handler, `shutdown()` to unblock `accept()`, receive timeout on clients    |
 | **Filesystem**      | `std::filesystem`, static file serving                                            |
 
 ---
@@ -329,11 +366,12 @@ HTTPRequest request = parser_.parse(requestBuffer);
 ### Using CMake
 
 ```bash
-mkdir build && cd build
-cmake ..
-make
-./http_server
+cmake -S . -B build
+cmake --build build
+./build/http_server
 ```
+
+The first configure downloads GoogleTest. The server sources, except `main.cpp`, are built as `http_server_lib` and linked into both `http_server` and `http_tests`.
 
 ### Manual compile
 
@@ -348,20 +386,29 @@ clang++ -std=c++20 -Wall -Wextra -Iinclude \
 ### Run
 
 ```bash
-./http_server              # default: port 8001, root public/
-./http_server 8080 www     # custom port and document root
+./build/http_server                         # port 8001, root public/, log level info
+./build/http_server 8080 www                # custom port and document root
+LOG_LEVEL=debug ./build/http_server         # also print debug lines
 ```
 
 ### Test
 
 ```bash
-# Single request
-curl http://localhost:8001/
+# Parser unit tests
+ctest --test-dir build --output-on-failure
+
+# One request, showing chunk framing
+curl -v --http1.1 --raw http://localhost:8001/
+
+# Several requests on one connection
+curl -v --http1.1 http://localhost:8001/ http://localhost:8001/
 
 # Load test (parallel requests)
 chmod +x test/load_test.sh
 ./test/load_test.sh
 ```
+
+Ctrl+C sends SIGINT. The process stops accepting, closes the listening socket, and exits after in-flight workers finish or hit the 2-second read timeout.
 
 ---
 
@@ -373,15 +420,19 @@ chmod +x test/load_test.sh
 **curl:**
 
 ```bash
-curl -v http://localhost:8001/file.jpeg
+curl -v --raw http://localhost:8001/file.jpeg
 ```
+
+The response headers include `Transfer-Encoding: chunked` and `Connection: keep-alive`. `--raw` leaves the hexadecimal chunk sizes visible.
 
 **Server log:**
 
 ```
 [2026-07-07 23:26:00] [INFO] Listening on port 8001
-[2026-07-07 23:26:05] [ACCESS] GET /file.jpeg->200	 | 26363 B  | 2
+[2026-07-07 23:26:05] [ACCESS] GET /file.jpeg->200	 | 0 B  | 2
 ```
+
+The size field is `response.body.size()`. Chunked file responses leave `body` empty, so the log shows `0 B` even when the file was sent.
 
 ---
 
@@ -393,9 +444,12 @@ curl -v http://localhost:8001/file.jpeg
 | **Partial body reads**  | Headers buffered until `\r\n\r\n`; request body (POST) not yet handled            |
 | **No body parsing**     | POST/PUT not supported                                                            |
 | **Path traversal risk** | `/../` not sanitized                                                              |
-| **Some raw stdout**     | A few debug prints in `handleClient` still use `std::cout` instead of `Logger`    |
 | **No HTTPS**            | Plain HTTP only                                                                   |
-| **Keep-alive partial**  | Loop exists but no explicit `Connection` header handling                          |
+| **Keep-alive**          | HTTP/1.1 stays open unless the client sends `Connection: close`. HTTP/1.0 closes unless the client sends `keep-alive`. |
+| **Chunked file bodies** | Successful files use `Transfer-Encoding: chunked` and no `Content-Length`. Access logs report `response.body.size()`, which is 0 for those responses. |
+| **Idle timeout**        | Each accepted socket has a 2-second `SO_RCVTIMEO`. Idle keep-alive waits again; shutdown uses the same timeout to unblock workers. |
+| **CRLF header parsing** | `HTTPParser` is tested with `\n` line endings. A `\r` left after the request line can make `getline` treat the next line as empty, so header tests do not use raw `\r\n` input. |
+| **Response tests**      | GoogleTest covers the parser. `HTTPResponse::serialize` and chunk framing are not covered by a unit test yet. |
 | **Single directory**    | All files under `public/`                                                         |
 
 ---
@@ -409,8 +463,13 @@ curl -v http://localhost:8001/file.jpeg
 5. **Concurrency** — `std::thread` → **ThreadPool** with `packaged_task`
 6. **Thread safety** — mutex on logger after observing stdout races under load
 7. **Structured logging** — `Logger` expanded with `info` / `debug` / `warning` / `error` / `access`; used in `Socket`, `ThreadPool`, `FileServer`, and `HTTPServer`
-8. **`SO_REUSEADDR`** — `Socket::setReuseAddress()` called before `bind()` for faster restarts
+8. `SO_REUSEADDR` — `Socket::setReuseAddress()` called before `bind()` for faster restarts
 9. **Request framing** — buffer until `\r\n\r\n` before parsing; fixes deadlock and fd leaks under concurrent load
+10. **Keep-alive** — `Connection` header decides whether the worker loops, and leftover bytes stay in `requestBuffer`
+11. **Chunked encoding** — `serializeHeaders()` plus `FileServer::openBinary()` stream file bodies
+12. **Graceful shutdown** — SIGINT flag, `shutdown()` on the listening socket, receive timeout so workers can be joined
+13. **Parser tests** — `tests/parser_test.cpp` linked with GoogleTest
+14. **Configurable log level** — `LOG_LEVEL` sets the `Logger` cutoff; `access` lines are not filtered
 
 ---
 
@@ -420,20 +479,29 @@ curl -v http://localhost:8001/file.jpeg
 - [x] Request buffering until `\r\n\r\n` (robust header parsing)
 - [x] Structured `Logger` with levels (`info`, `debug`, `warning`, `error`, `access`)
 - [x] Configurable port and document root
-- [ ] Route remaining `std::cout` debug output through `Logger`
-- [ ] Skip invalid sockets after failed `accept()` (`!client.isValid()`)
-- [ ] Configurable log level (e.g. `LOG_LEVEL=debug`)
+- [x] Explicit `Connection` handling and HTTP/1.1 keep-alive
+- [x] `HTTP/1.1` chunked encoding for file responses
+- [x] Graceful shutdown on SIGINT
+- [x] Unit tests for the parser
+- [x] Skip invalid sockets after failed `accept()` (`!client.isValid()`)
+- [x] Route remaining `std::cout` debug output through `Logger`
+- [x] Configurable log level (e.g. `LOG_LEVEL=debug`)
 - [ ] Path normalization / traversal protection
-- [ ] Explicit `Connection: close` or full keep-alive support
-- [ ] `HTTP/1.1` chunked encoding for large files
-- [ ] Graceful shutdown on SIGINT
-- [ ] Unit tests for parser and response serialization
+- [ ] Unit tests for response serialization and chunk framing
+- [ ] Trim header values and accept `\r\n` line endings in `HTTPParser`
+- [ ] Count streamed bytes in the access log
+- [ ] Benchmark your existing server — establish throughput and tail-latency baselines.
+- [ ] Implement a kqueue-based event loop — start with non-blocking accept and read operations.
+- [ ] Add per-connection state machines — track partial requests, responses, and Keep-Alive.
+- [ ] Integrate streaming and backpressure — stop reading or writing when buffers reach safe limits.
+- [ ] Compare architectures under load — test different client counts and workloads.
 
 ---
 
 ## 11. Dependencies
 
-- **C++17** (CMake) or **C++20** (manual build for `ends_with`)
+- **C++20** (`std::string::ends_with` in `MimeResolver`; CMake sets `CMAKE_CXX_STANDARD` to 20)
+- GoogleTest 1.15.2, fetched by CMake at configure time
 - POSIX sockets (`sys/socket.h`, `netinet/in.h`, `unistd.h`)
 - Standard library: `<thread>`, `<mutex>`, `<condition_variable>`, `<filesystem>`, `<future>`
 
@@ -447,18 +515,21 @@ curl -v http://localhost:8001/file.jpeg
 main()
   └── HTTPServer::start()
         ├── Socket::create/bind/listen
-        ├── Socket::accept()          [loop]
+        ├── Socket::accept()          [until SIGINT]
+        ├── Socket::setReceiveTimeout()
         └── ThreadPool::submit()
               └── HTTPServer::handleClient()
-                    ├── Socket::receive()       [until \r\n\r\n]
-                    ├── HTTPParser::parse()
-                    ├── FileServer::exists/readFile()
+                    ├── Socket::receive()       [until \r\n\r\n, or timeout]
+                    ├── HTTPParser::parse()     [one request; leftover bytes kept]
+                    ├── FileServer::openBinary() or in-memory 404
                     ├── MimeResolver::getMime()
-                    ├── HTTPResponse::serialize()
-                    ├── Socket::send()
+                    ├── HTTPResponse::serializeHeaders() or serialize()
+                    ├── Socket::send()          [headers, chunks, or full 404]
                     └── Logger::access()
 ```
 
+On SIGINT, `onSigint` sets `g_stop` and calls `shutdown()` on the listening descriptor. `start()` closes the listener and returns. Destroying `HTTPServer` joins the pool.
+
 ---
 
-*This document describes the http-server project as of July 2026. It is intended as both a user guide and a learning reference for systems programming in C++.*
+*This document describes the http-server project as of October 2026. It is intended as both a user guide and a learning reference for systems programming in C++.*

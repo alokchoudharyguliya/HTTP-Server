@@ -1,22 +1,26 @@
 #include "HTTPServer.h"
 #include "Logger.h"
+#include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <stdlib.h>
 #include <string>
-#include<csignal>
-#include<sys/socket.h>
-volatile sig_atomic_t g_stop=0;
-int g_listenFd=-1;
+#include <sys/socket.h>
+volatile sig_atomic_t g_stop = 0;
+int g_listenFd = -1;
 
-void onSigint(int){
-  g_stop=1;
-  if(g_listenFd>=0)
-  ::shutdown(g_listenFd, SHUT_RDWR);
+void onSigint(int) {
+  g_stop = 1;
+  if (g_listenFd >= 0)
+    ::shutdown(g_listenFd, SHUT_RDWR);
 }
 
 int main(int argc, char *argv[]) {
   int port = 8001;
   std::string root = "public";
+  const char *level = std::getenv("LOG_LEVEL");
+  if (level != nullptr)
+    Logger::setLevelFromString(level);
   // if(argc<3){
   // Logger::warning("Usage: ./http_server <port> <documentRoot>");
   // std::cout<<"Helper Message: use ./http_server <port> <documentRoot>\n";

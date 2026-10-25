@@ -3,7 +3,6 @@
 #include "Logger.h"
 #include "MimeResolver.h"
 #include <chrono>
-#include <iostream>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
@@ -69,7 +68,6 @@ void HTTPServer::start() {
   listener_.listen();
   g_listenFd=listener_.fd();
   
-  std::cout << "Server is listening on port " << port_ << "\n";
   // while (true) {
   while(!g_stop){
     // std::cout << "Waiting for a client\n";
@@ -186,7 +184,7 @@ void HTTPServer::handleClient(Socket client) {
     // std::cout << ">>Path:" << request.path << "\n";
     // std::cout << ">>Version:" << request.version << "\n";
 
-    std::cout << "Received:\n";
+    Logger::debug("Received request");
     std::string filePath;
     if (request.path == "/")
       filePath = documentRoot_ + "/index.html";
@@ -279,7 +277,7 @@ void HTTPServer::handleClient(Socket client) {
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
     Logger::access(request, response, duration.count());
-    std::cout << buffer << "\n";
+    Logger::debug(std::string("Raw buffer: ") + buffer);
     for (const auto &header : request.headers)
       std::cout << header.first << "<" << header.second << "\n";
     if (shouldClose)

@@ -63,5 +63,4 @@ void ThreadPool::workerLoop() {
       // std::cerr << "Unknown exception\n";
     }
   }
-  std::cout << "Worker exiting\n";
 }
