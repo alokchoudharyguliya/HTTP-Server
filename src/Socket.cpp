@@ -1,10 +1,12 @@
 #include "Socket.h"
 #include "Logger.h"
+#include <cerrno>
+#include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
+#include<poll.h>
 void Socket::create() {
   socketFd_ = socket(AF_INET, SOCK_STREAM, 0);
   // if (socketFd_ == -1)
@@ -40,10 +42,11 @@ void Socket::listen(int backlog) {
 }
 Socket Socket::accept() {
   int clientFd = ::accept(socketFd_, nullptr, nullptr);
-  if (clientFd == -1)
-    Logger::error("Failed to accept client: " + std::string(strerror(errno)));
-  //   return Socket();
-  // }
+  if (clientFd == -1) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK)
+      Logger::error("Failed to accept client: " + std::string(strerror(errno)));
+    return Socket();
+  }
   return Socket(clientFd);
 }
 void Socket::close() {
@@ -63,6 +66,16 @@ ssize_t Socket::send(const void *buffer, size_t length) {
     if (n < 0) {
       if (errno == EINTR)
         continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // The socket is non-blocking and the kernel send buffer is full.
+        // Wait until it can take more bytes, then continue this write.
+        // This waits inside send, so the kqueue loop does not run other clients until it returns.
+        pollfd ready{};
+        ready.fd = socketFd_;
+        ready.events = POLLOUT;
+        ::poll(&ready, 1, -1);
+        continue;
+      }
       return -1;
     }
     if (n == 0)
@@ -105,3 +118,9 @@ void Socket::setReceiveTimeout(int seconds) {
 // User-Agent: Chrome\r\n
 // Accept: */*\r\n
 // \r\n -> Last line, marks headers finished
+
+// accept and recv return EAGAIN instead of sleeping when the socket has nothing ready.
+void Socket::setNonBlocking() {
+  int flags = ::fcntl(socketFd_, F_GETFL, 0);
+  ::fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
+}

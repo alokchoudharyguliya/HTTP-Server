@@ -24,6 +24,7 @@ class Socket{
 		bool isValid()const;
 		int fd() const;
 		void setReceiveTimeout(int seconds);
+		void setNonBlocking();
 	private:
 		int socketFd_;
 };

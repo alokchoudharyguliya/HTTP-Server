@@ -18,8 +18,8 @@ This project implements a minimal but functional HTTP server that:
 - Serves static files from the `public/` directory
 - Streams file bodies with `Transfer-Encoding: chunked` (404 responses use `Content-Length`)
 - Keeps HTTP/1.1 connections open unless the client sends `Connection: close`
-- Handles multiple clients concurrently using a **thread pool**
-- Stops accepting new connections on Ctrl+C and joins the worker threads
+- Watches the listening socket and every client with a **kqueue** event loop on one thread
+- Stops accepting new connections on Ctrl+C and closes the open client sockets
 - Logs events and requests with timestamps, levels, status, size, and latency
 
 It was evolved from a single-file prototype into a multi-module C++17 codebase, demonstrating networking, HTTP basics, RAII, and concurrent programming.
@@ -29,7 +29,8 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
 - **Keep-alive** — one worker serves repeated requests on the same socket and preserves bytes already read past the current request
 - **Chunked responses** — file bodies are read and sent in fixed-size buffers with a terminating `0` chunk
 - **Full writes** — `Socket::send()` loops until the whole buffer is written
-- **Graceful shutdown** — SIGINT sets a flag, unblocks `accept()`, and lets idle workers exit on a receive timeout
+- **Graceful shutdown** — SIGINT sets a flag and `shutdown()` wakes the kqueue wait
+- **kqueue** — non-blocking `accept` and `read`. Idle keep-alive connections stay registered and do not occupy a thread. A ninth request returned in 0.001 s while eight connections sat idle. Busy `wrk` runs are slower than the 8-worker pool, because one thread serves every socket and `send` still waits in `poll` if the kernel buffer is full. Numbers are in `bench.md`.
 - **Parser tests** — GoogleTest covers `HTTPParser` without opening a socket
 - **Logger** — level-based, mutex-protected logging. `LOG_LEVEL` selects `debug`, `info` (the default), `warning`, or `error`. Access lines are always printed.
 - `\r\n\r\n` **framing** — incremental request reads until headers are complete
@@ -42,7 +43,7 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
 ```
 ┌─────────────-┐     TCP      ┌──────────────────────────────────────────┐
 │   Client     │ ──────────►  │              HTTPServer                  │
-│(curl/browser)|              │  accept loop → ThreadPool → handleClient │
+│(curl/browser)|              │  kevent → acceptReady / readReady        │
 └─────────────-┘              └─────┬───-────────────────────────────────┘
                                     │
                     ┌───────────────┼───────────────┐
@@ -64,11 +65,11 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
 
 ### Request lifecycle
 
-1. **Main thread** blocks on `listener_.accept()` waiting for a client.
-2. Accepted `Socket` is moved into a **packaged task** and submitted to the **ThreadPool** (8 workers).
-3. Worker runs `handleClient()`:
-   - `recv()` into a buffer, appending to `requestBuffer` until `\r\n\r\n` is found. A 2-second timeout with no data keeps the connection open.
-   - Only the bytes up to that delimiter are parsed. Anything after them stays in `requestBuffer` for the next request.
+1. **One thread** blocks in `kevent()` until the listening socket or any client socket is readable.
+2. A readable listening socket calls `accept()` until it returns `EAGAIN`. Each new socket is non-blocking and registered for read. Its buffer lives in `connections_`.
+3. A readable client runs `readReady()`, then `handleOneRequest()` once the buffer contains `\r\n\r\n`:
+   - `recv()` appends until `EAGAIN`. A return of 0 means the client closed the connection.
+   - Only the bytes up to `\r\n\r\n` are parsed. Anything after them stays in that connection's buffer. If another full request is already there, it is handled before returning to `kevent`.
    - `HTTPParser` parses method, path, version, headers
    - Map path → file under `public/`
    - A found file is opened in binary mode and sent as chunked data. A missing file is a small in-memory 404 with `Content-Length`.
@@ -76,7 +77,7 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
    - `Connection` is `close` when the client asked for it, or when the request is HTTP/1.0 without `keep-alive`. Otherwise it is `keep-alive`.
    - `Socket::send()` writes every byte of the headers and each chunk
    - `Logger::access()` records the transaction
-4. The worker loops for another request on the same connection unless `Connection: close` was chosen, the client disconnected, or shutdown was requested.
+4. The socket stays registered unless `Connection: close` was chosen, the send failed, or the client disconnected. An idle connection does not block the thread. `ThreadPool` is still constructed and is not used for these connections.
 
 ---
 
@@ -447,7 +448,8 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 | **No HTTPS**            | Plain HTTP only                                                                   |
 | **Keep-alive**          | HTTP/1.1 stays open unless the client sends `Connection: close`. HTTP/1.0 closes unless the client sends `keep-alive`. |
 | **Chunked file bodies** | Successful files use `Transfer-Encoding: chunked` and no `Content-Length`. Access logs report `response.body.size()`, which is 0 for those responses. |
-| **Idle timeout**        | Each accepted socket has a 2-second `SO_RCVTIMEO`. Idle keep-alive waits again; shutdown uses the same timeout to unblock workers. |
+| **Send can stall the loop** | `Socket::send` waits in `poll` when a non-blocking write returns `EAGAIN`. Other clients are not read until that write finishes. |
+| **macOS kqueue**        | The event loop uses `kqueue` / `kevent`. It does not run on Linux without an `epoll` equivalent. |
 | **CRLF header parsing** | `HTTPParser` is tested with `\n` line endings. A `\r` left after the request line can make `getline` treat the next line as empty, so header tests do not use raw `\r\n` input. |
 | **Response tests**      | GoogleTest covers the parser. `HTTPResponse::serialize` and chunk framing are not covered by a unit test yet. |
 | **Single directory**    | All files under `public/`                                                         |
@@ -470,6 +472,7 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 12. **Graceful shutdown** — SIGINT flag, `shutdown()` on the listening socket, receive timeout so workers can be joined
 13. **Parser tests** — `tests/parser_test.cpp` linked with GoogleTest
 14. **Configurable log level** — `LOG_LEVEL` sets the `Logger` cutoff; `access` lines are not filtered
+15. **kqueue event loop** — one thread accepts and reads non-blocking sockets. Idle keep-alive connections stay registered instead of blocking a worker. Against the thread-pool baseline, the idle ninth request returns immediately, and busy `wrk` throughput drops. See `bench.md`.
 
 ---
 
@@ -489,12 +492,13 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 - [x] Path normalization / traversal protection
 - [x] Unit tests for response serialization and chunk framing
 - [x] Trim header values and accept `\r\n` line endings in `HTTPParser`
-- [ ] Count streamed bytes in the access log
-- [ ] Benchmark your existing server — establish throughput and tail-latency baselines.
-- [ ] Implement a kqueue-based event loop — start with non-blocking accept and read operations.
+- [x] Count streamed bytes in the access log
+- [x] Benchmark your existing server — establish throughput and tail-latency baselines.
+- [x] Implement a kqueue-based event loop — non-blocking accept and read
+- [ ] Drive writes from `EVFILT_WRITE` instead of waiting in `poll` inside `send`
 - [ ] Add per-connection state machines — track partial requests, responses, and Keep-Alive.
 - [ ] Integrate streaming and backpressure — stop reading or writing when buffers reach safe limits.
-- [ ] Compare architectures under load — test different client counts and workloads.
+- [x] Compare architectures under load — same `wrk` commands on the thread pool and on kqueue. Idle keep-alive is fixed. Busy throughput is lower on the one thread. See `bench.md`.
 
 ---
 
@@ -502,7 +506,7 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 
 - **C++20** (`std::string::ends_with` in `MimeResolver`; CMake sets `CMAKE_CXX_STANDARD` to 20)
 - GoogleTest 1.15.2, fetched by CMake at configure time
-- POSIX sockets (`sys/socket.h`, `netinet/in.h`, `unistd.h`)
+- POSIX sockets (`sys/socket.h`, `netinet/in.h`, `unistd.h`) and, on macOS, `kqueue` (`sys/event.h`)
 - Standard library: `<thread>`, `<mutex>`, `<condition_variable>`, `<filesystem>`, `<future>`
 
 **Platform:** macOS / Linux (POSIX). Not Windows-native without Winsock changes.
@@ -514,21 +518,20 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 ```
 main()
   └── HTTPServer::start()
-        ├── Socket::create/bind/listen
-        ├── Socket::accept()          [until SIGINT]
-        ├── Socket::setReceiveTimeout()
-        └── ThreadPool::submit()
-              └── HTTPServer::handleClient()
-                    ├── Socket::receive()       [until \r\n\r\n, or timeout]
+        ├── Socket::create/bind/listen/setNonBlocking
+        ├── kqueue() + kevent()
+        ├── acceptReady() → watch each client for read
+        └── readReady()
+              └── handleOneRequest()
                     ├── HTTPParser::parse()     [one request; leftover bytes kept]
-                    ├── FileServer::openBinary() or in-memory 404
+                    ├── FileServer::openBinary() or in-memory 403/404
                     ├── MimeResolver::getMime()
                     ├── HTTPResponse::serializeHeaders() or serialize()
-                    ├── Socket::send()          [headers, chunks, or full 404]
+                    ├── Socket::send()          [headers, chunks, or full error page]
                     └── Logger::access()
 ```
 
-On SIGINT, `onSigint` sets `g_stop` and calls `shutdown()` on the listening descriptor. `start()` closes the listener and returns. Destroying `HTTPServer` joins the pool.
+On SIGINT, `onSigint` sets `g_stop` and calls `shutdown()` on the listening descriptor. That wakes `kevent`. `start()` clears `connections_`, closes the kqueue, closes the listener, and returns.
 
 ---
 
