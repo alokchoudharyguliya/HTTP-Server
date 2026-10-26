@@ -12,8 +12,8 @@
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <utility>
-#include<unistd.h>
 
 namespace fs = std::filesystem;
 extern volatile sig_atomic_t g_stop;
@@ -34,11 +34,74 @@ HTTPServer::HTTPServer(int port, const std::string &root)
     : port_(port), threadPool_(8), documentRoot_(root) {}
 
 // Ask kqueue to wake kevent when this descriptor has bytes to read.
-// EVFILT_READ stays registered, so a keep-alive socket is watched without a thread blocked in recv.
+// EVFILT_READ stays registered, so a keep-alive socket is watched without a
+// thread blocked in recv.
 static void watchRead(int kq, int fd) {
   struct kevent change;
   EV_SET(&change, fd, EVFILT_READ, EV_ADD, 0, 0, nullptr);
   ::kevent(kq, &change, 1, nullptr, 0, nullptr);
+}
+static void watchWrite(int kq, int fd) {
+  struct kevent change;
+  EV_SET(&change, fd, EVFILT_WRITE, EV_ADD, 0, 0, nullptr);
+  ::kevent(kq, &change, 1, nullptr, 0, nullptr);
+}
+static void unwatchWrite(int kq, int fd) {
+  struct kevent change;
+  EV_SET(&change, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+  ::kevent(kq, &change, 1, nullptr, 0, nullptr);
+}
+
+bool HTTPServer::flush(Connection &conn) {
+  int fd = conn.socket.fd();
+  while (true) {
+    if (!conn.outgoing.empty()) {
+      ssize_t n = conn.socket.send(conn.outgoing.data(), conn.outgoing.size());
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          watchWrite(kq_, fd);
+          conn.writeWatched = true;
+          return false;
+        }
+        Logger::error("Failed to send response");
+        conn.responding = false;
+        conn.shouldClose = true;
+        return true;
+      }
+      conn.outgoing.erase(0, static_cast<size_t>(n));
+      if (!conn.outgoing.empty()) {
+        watchWrite(kq_, fd);
+        conn.writeWatched = true;
+        return false;
+      }
+    }
+    if (conn.streaming) {
+      char fileBuffer[4096];
+      conn.file.read(fileBuffer, sizeof(fileBuffer));
+      std::streamsize got = conn.file.gcount();
+      if (got > 0) {
+        conn.bytesSent += static_cast<size_t>(got);
+        conn.outgoing = HTTPResponse::formatChunk(
+            std::string(fileBuffer, static_cast<size_t>(got)));
+        continue;
+      }
+      conn.file.close();
+      conn.streaming = false;
+      conn.outgoing = HTTPResponse::chunkTerminator();
+      continue;
+    }
+    if (conn.writeWatched) {
+      unwatchWrite(kq_, fd);
+      conn.writeWatched = false;
+    }
+    auto end = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end - conn.started);
+    Logger::access(conn.request, conn.response, duration.count(),
+                   conn.bytesSent);
+    conn.responding = false;
+    return true;
+  }
 }
 
 void HTTPServer::acceptReady() {
@@ -69,14 +132,16 @@ void HTTPServer::readReady(int fd) {
   while (true) {
     ssize_t n = conn.socket.receive(buffer, sizeof(buffer));
     if (n < 0) {
-      // EAGAIN means the kernel has nothing more right now. The connection stays registered.
+      // EAGAIN means the kernel has nothing more right now. The connection
+      // stays registered.
       if (errno == EAGAIN || errno == EWOULDBLOCK)
         break;
       connections_.erase(found);
       return;
     }
     if (n == 0) {
-      // The peer closed the connection. Bytes already read may still hold a full request.
+      // The peer closed the connection. Bytes already read may still hold a
+      // full request.
       closed = true;
       break;
     }
@@ -86,16 +151,25 @@ void HTTPServer::readReady(int fd) {
   // if (headerEnd == std::string::npos)
   //   return;
   // One recv can contain more than one request. Handle each completed one
-  // before returning to kevent, or the leftover request would wait for more bytes.
-  while (conn.buffer.find("\r\n\r\n") != std::string::npos) {
-    bool shouldClose = handleOneRequest(conn.socket, conn.buffer);
-    if (shouldClose) {
-      connections_.erase(fd);
-      return;
-    }
-  }
+  // before returning to kevent, or the leftover request would wait for more
+  // bytes.
+  // while (conn.buffer.find("\r\n\r\n") != std::string::npos) {
+  //   bool shouldClose = handleOneRequest(conn.socket, conn.buffer);
+  //   if (shouldClose) {
+  //     connections_.erase(fd);
+  //     return;
+  //   }
+  // }
   if (closed)
-    connections_.erase(fd);
+    conn.shouldClose = true;
+  progress(fd);
+  if (closed) {
+    auto still = connections_.find(fd);
+    if (still != connections_.end() && !still->second.responding)
+      connections_.erase(fd);
+  }
+  // if (closed)
+  //   connections_.erase(fd);
 }
 
 void HTTPServer::start() {
@@ -139,7 +213,8 @@ void HTTPServer::start() {
   listener_.listen();
   g_listenFd = listener_.fd();
 
-  // The listening socket must not block in accept. kqueue sleeps once for every watched fd.
+  // The listening socket must not block in accept. kqueue sleeps once for every
+  // watched fd.
   listener_.setNonBlocking();
   kq_ = ::kqueue();
   watchRead(kq_, listener_.fd());
@@ -163,7 +238,8 @@ void HTTPServer::start() {
   // }
 
   while (!g_stop) {
-    // Sleep until any registered socket is readable. EINTR is a signal during that wait.
+    // Sleep until any registered socket is readable. EINTR is a signal during
+    // that wait.
     int n = ::kevent(kq_, nullptr, 0, events, 64, nullptr);
     if (n < 0) {
       if (errno == EINTR)
@@ -174,6 +250,8 @@ void HTTPServer::start() {
       int fd = static_cast<int>(events[i].ident);
       if (fd == listener_.fd())
         acceptReady();
+      else if (events[i].filter == EVFILT_WRITE)
+        writeReady(fd);
       else
         readReady(fd);
     }
@@ -186,18 +264,18 @@ void HTTPServer::start() {
   listener_.close();
 }
 
-bool HTTPServer::handleOneRequest(Socket &client, std::string &requestBuffer) {
+bool HTTPServer::handleOneRequest(Connection &conn) {
   // char buffer[4097];
   // std::string requestBuffer;
   // while (true) {
-  auto headerEnd = requestBuffer.find("\r\n\r\n");
+  auto headerEnd = conn.buffer.find("\r\n\r\n");
   if (headerEnd == std::string::npos)
     return false;
   bool shouldClose = false;
   auto start = std::chrono::high_resolution_clock::now();
   const size_t consumed = headerEnd + 4;
-  HTTPRequest request = parser_.parse(requestBuffer.substr(0, consumed));
-  requestBuffer.erase(0, consumed);
+  HTTPRequest request = parser_.parse(conn.buffer.substr(0, consumed));
+  conn.buffer.erase(0, consumed);
   // ssize_t headerEnd = requestBuffer.find("\r\n\r\n");
   Logger::debug("Request: " + request.method + " " + request.path + " " +
                 request.version);
@@ -249,56 +327,74 @@ bool HTTPServer::handleOneRequest(Socket &client, std::string &requestBuffer) {
     response.headers["Connection"] = "close";
   } else
     response.headers["Connection"] = "keep-alive";
+  conn.request = std::move(request);
+  conn.response = std::move(response);
+  conn.bytesSent = bytesSent;
+  conn.shouldClose = conn.shouldClose || shouldClose;
+  conn.started = std::chrono::steady_clock::now();
+  conn.responding = true;
+  // if (!streamFile) {
+  //   response.headers["Content-Length"] =
+  //   std::to_string(response.body.size()); std::string rawResponse =
+  //   response.serialize(); if (client.send(rawResponse.c_str(),
+  //   rawResponse.size()) < 0) {
+  //     Logger::error("Failed to send response");
+  //     return true;
+  //   }
+  // } else {
+  //   response.headers["Transfer-Encoding"] = "chunked";
+  //   std::string rawHeaders = response.serializeHeaders();
+  //   if (client.send(rawHeaders.c_str(), rawHeaders.size()) < 0) {
+  //     Logger::error("Failed to send response");
+  //     return true;
+  //   }
+  //   char fileBuffer[4096];
+  //   while (file) {
+  //     file.read(fileBuffer, sizeof(fileBuffer));
+  //     std::streamsize n = file.gcount();
+  //     if (n <= 0)
+  //       break;
+  //     bytesSent += static_cast<size_t>(n);
+  //     std::string chunk = HTTPResponse::formatChunk(
+  //         std::string(fileBuffer, static_cast<size_t>(n)));
+  //     if (client.send(chunk.c_str(), chunk.size()) < 0) {
+  //       Logger::error("Failed to send response");
+  //       return true;
+  //     }
+  //   }
+  //   std::string terminator = HTTPResponse::chunkTerminator();
+  //   if (client.send(terminator.c_str(), terminator.size()) < 0) {
+  //     Logger::error("Failed to send response");
+  //     return true;
+  //   }
+  // }
+  // auto end = std::chrono::high_resolution_clock::now();
+  // auto duration =
+  //     std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+  // Logger::access(request, response, duration.count(), bytesSent);
+  // // Logger::debug(std::string("Raw buffer: ") + buffer);
+  // for (const auto &header : request.headers)
+  //   Logger::debug(header.first + "<" + header.second + "\n");
+  // // if (shouldClose)
+  // //   break;
+  // // }
+  // return shouldClose;
 
   if (!streamFile) {
-    response.headers["Content-Length"] = std::to_string(response.body.size());
-    std::string rawResponse = response.serialize();
-    if (client.send(rawResponse.c_str(), rawResponse.size()) < 0) {
-      Logger::error("Failed to send response");
-      return true;
-    }
+    conn.streaming = false;
+    conn.file.close();
+    conn.response.headers["Content-Length"] =
+        std::to_string(conn.response.body.size());
+    conn.outgoing = conn.response.serialize();
   } else {
-    response.headers["Transfer-Encoding"] = "chunked";
-    std::string rawHeaders = response.serializeHeaders();
-    if (client.send(rawHeaders.c_str(), rawHeaders.size()) < 0) {
-      Logger::error("Failed to send response");
-      return true;
-    }
-    char fileBuffer[4096];
-    while (file) {
-      file.read(fileBuffer, sizeof(fileBuffer));
-      std::streamsize n = file.gcount();
-      if (n <= 0)
-        break;
-      bytesSent += static_cast<size_t>(n);
-      std::string chunk = HTTPResponse::formatChunk(
-          std::string(fileBuffer, static_cast<size_t>(n)));
-      if (client.send(chunk.c_str(), chunk.size()) < 0) {
-        Logger::error("Failed to send response");
-        return true;
-      }
-    }
-    std::string terminator = HTTPResponse::chunkTerminator();
-    if (client.send(terminator.c_str(), terminator.size()) < 0) {
-      Logger::error("Failed to send response");
-      return true;
-    }
+    conn.file = std::move(file);
+    conn.streaming = true;
+    conn.response.headers["Transfer-Encoding"] = "chunked";
+    conn.outgoing = conn.response.serializeHeaders();
   }
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration =
-      std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-  Logger::access(request, response, duration.count(), bytesSent);
-  // Logger::debug(std::string("Raw buffer: ") + buffer);
-  for (const auto &header : request.headers)
-    Logger::debug(header.first + "<" + header.second + "\n");
-  // if (shouldClose)
-  //   break;
-  // }
-  return shouldClose;
+  return conn.shouldClose;
 }
-
-
 
 // void HTTPServer::handleClient(Socket client) {
 //   char buffer[4097];
@@ -529,3 +625,24 @@ bool HTTPServer::handleOneRequest(Socket &client, std::string &requestBuffer) {
 //     // }
 //   }
 // }
+void HTTPServer::progress(int fd) {
+  auto found = connections_.find(fd);
+  if (found == connections_.end())
+    return;
+  Connection &conn = found->second;
+  while (true) {
+    if (conn.responding) {
+      if (!flush(conn))
+        return;
+      if (conn.shouldClose) {
+        connections_.erase(fd);
+        return;
+      }
+    }
+    if (conn.buffer.find("\r\n\r\n") == std::string::npos)
+      return;
+    handleOneRequest(conn);
+  }
+}
+
+void HTTPServer ::writeReady(int fd) { progress(fd); }

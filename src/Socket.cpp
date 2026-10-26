@@ -66,20 +66,21 @@ ssize_t Socket::send(const void *buffer, size_t length) {
     if (n < 0) {
       if (errno == EINTR)
         continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      if ((errno == EAGAIN || errno == EWOULDBLOCK)&&sentTotal>0) {
         // The socket is non-blocking and the kernel send buffer is full.
         // Wait until it can take more bytes, then continue this write.
         // This waits inside send, so the kqueue loop does not run other clients until it returns.
-        pollfd ready{};
-        ready.fd = socketFd_;
-        ready.events = POLLOUT;
-        ::poll(&ready, 1, -1);
-        continue;
+        // pollfd ready{};
+        // ready.fd = socketFd_;
+        // ready.events = POLLOUT;
+        // ::poll(&ready, 1, -1);
+        // continue;
+        return static_cast<ssize_t>(sentTotal);
       }
       return -1;
     }
     if (n == 0)
-      return -1;
+      return sentTotal>0?static_cast<ssize_t>(sentTotal):-1;
     sentTotal += static_cast<size_t>(n);
   }
   return static_cast<ssize_t>(sentTotal);

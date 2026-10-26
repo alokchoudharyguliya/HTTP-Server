@@ -28,9 +28,9 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
 
 - **Keep-alive** — one worker serves repeated requests on the same socket and preserves bytes already read past the current request
 - **Chunked responses** — file bodies are read and sent in fixed-size buffers with a terminating `0` chunk
-- **Full writes** — `Socket::send()` loops until the whole buffer is written
+- **Full writes** — `Socket::send()` writes what the kernel accepts. A full buffer returns a short count instead of waiting
 - **Graceful shutdown** — SIGINT sets a flag and `shutdown()` wakes the kqueue wait
-- **kqueue** — non-blocking `accept` and `read`. Idle keep-alive connections stay registered and do not occupy a thread. A ninth request returned in 0.001 s while eight connections sat idle. Busy `wrk` runs are slower than the 8-worker pool, because one thread serves every socket and `send` still waits in `poll` if the kernel buffer is full. Numbers are in `bench.md`.
+- **kqueue** — non-blocking `accept` and `read`, and `EVFILT_WRITE` while a response is unfinished. Idle keep-alive connections stay registered and do not occupy a thread. A ninth request returned in 0.001 s while eight connections sat idle. A client that stopped reading `big.bin` left `GET /` at a few milliseconds; a client that kept reading it dropped `/` to about 24 req/s. Numbers are in `bench.md`.
 - **Parser tests** — GoogleTest covers `HTTPParser` without opening a socket
 - **Logger** — level-based, mutex-protected logging. `LOG_LEVEL` selects `debug`, `info` (the default), `warning`, or `error`. Access lines are always printed.
 - `\r\n\r\n` **framing** — incremental request reads until headers are complete
@@ -43,7 +43,7 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
 ```
 ┌─────────────-┐     TCP      ┌──────────────────────────────────────────┐
 │   Client     │ ──────────►  │              HTTPServer                  │
-│(curl/browser)|              │  kevent → acceptReady / readReady        │
+│(curl/browser)|              │  kevent → accept / read / write          │
 └─────────────-┘              └─────┬───-────────────────────────────────┘
                                     │
                     ┌───────────────┼───────────────┐
@@ -65,19 +65,19 @@ It was evolved from a single-file prototype into a multi-module C++17 codebase, 
 
 ### Request lifecycle
 
-1. **One thread** blocks in `kevent()` until the listening socket or any client socket is readable.
+1. **One thread** blocks in `kevent()` until a watched socket is readable or, while a response is unfinished, writable.
 2. A readable listening socket calls `accept()` until it returns `EAGAIN`. Each new socket is non-blocking and registered for read. Its buffer lives in `connections_`.
 3. A readable client runs `readReady()`, then `handleOneRequest()` once the buffer contains `\r\n\r\n`:
    - `recv()` appends until `EAGAIN`. A return of 0 means the client closed the connection.
-   - Only the bytes up to `\r\n\r\n` are parsed. Anything after them stays in that connection's buffer. If another full request is already there, it is handled before returning to `kevent`.
+   - Only the bytes up to `\r\n\r\n` are parsed. Anything after them stays in that connection's buffer. The next request waits until the current response has finished.
    - `HTTPParser` parses method, path, version, headers
    - Map path → file under `public/`
-   - A found file is opened in binary mode and sent as chunked data. A missing file is a small in-memory 404 with `Content-Length`.
+   - A found file stays open on the connection and is sent as chunked data. A missing file is a small in-memory 404 with `Content-Length`.
    - `MimeResolver` sets `Content-Type`
    - `Connection` is `close` when the client asked for it, or when the request is HTTP/1.0 without `keep-alive`. Otherwise it is `keep-alive`.
-   - `Socket::send()` writes every byte of the headers and each chunk
-   - `Logger::access()` records the transaction
-4. The socket stays registered unless `Connection: close` was chosen, the send failed, or the client disconnected. An idle connection does not block the thread. `ThreadPool` is still constructed and is not used for these connections.
+   - `flush()` calls `Socket::send()` until the kernel buffer is full. The unsent tail and the open file stay on the connection, and the socket is registered for `EVFILT_WRITE`.
+   - `writeReady()` resumes that tail. `Logger::access()` runs once the terminator, or the whole error page, has been accepted.
+4. The read registration stays unless `Connection: close` was chosen, the send failed, or the client disconnected. The write registration is removed when the response is finished. An idle connection does not block the thread. A client that keeps a large body draining still occupies the thread between `EAGAIN`s, because `flush` writes until the buffer is full. `ThreadPool` is still constructed and is not used for these connections.
 
 ---
 
@@ -131,7 +131,7 @@ Wraps POSIX socket APIs with resource-safe ownership.
 | `listen()`           | `listen()`                    | Start listening                          |
 | `accept()`           | `accept()`                    | Accept client connection                 |
 | `receive()`          | `recv()`                      | Read bytes                               |
-| `send()`             | `send()` in a loop            | Write every byte, retrying on `EINTR`    |
+| `send()`             | `send()` in a loop            | Write what the kernel takes. `EAGAIN` returns the count already copied |
 | `close()`            | `close()`                     | Close FD safely                          |
 | `fd()`               | —                             | Listening descriptor used to wake `accept()` |
 | `setReceiveTimeout()`| `setsockopt(SO_RCVTIMEO)`     | Bound how long a worker blocks in `recv()` |
@@ -448,7 +448,7 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 | **No HTTPS**            | Plain HTTP only                                                                   |
 | **Keep-alive**          | HTTP/1.1 stays open unless the client sends `Connection: close`. HTTP/1.0 closes unless the client sends `keep-alive`. |
 | **Chunked file bodies** | Successful files use `Transfer-Encoding: chunked` and no `Content-Length`. Access logs report `response.body.size()`, which is 0 for those responses. |
-| **Send can stall the loop** | `Socket::send` waits in `poll` when a non-blocking write returns `EAGAIN`. Other clients are not read until that write finishes. |
+| **A fast reader holds the thread** | `flush` keeps writing until `send` returns `EAGAIN`. A client that drains `big.bin` as fast as it arrives leaves few gaps: `/` fell to about 24 req/s during that transfer. A client that stops reading fills the buffer once, then waits on `EVFILT_WRITE`, and other requests stay fast. |
 | **macOS kqueue**        | The event loop uses `kqueue` / `kevent`. It does not run on Linux without an `epoll` equivalent. |
 | **CRLF header parsing** | `HTTPParser` is tested with `\n` line endings. A `\r` left after the request line can make `getline` treat the next line as empty, so header tests do not use raw `\r\n` input. |
 | **Response tests**      | GoogleTest covers the parser. `HTTPResponse::serialize` and chunk framing are not covered by a unit test yet. |
@@ -473,6 +473,7 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 13. **Parser tests** — `tests/parser_test.cpp` linked with GoogleTest
 14. **Configurable log level** — `LOG_LEVEL` sets the `Logger` cutoff; `access` lines are not filtered
 15. **kqueue event loop** — one thread accepts and reads non-blocking sockets. Idle keep-alive connections stay registered instead of blocking a worker. Against the thread-pool baseline, the idle ninth request returns immediately, and busy `wrk` throughput drops. See `bench.md`.
+16. **`EVFILT_WRITE`** — a full send buffer registers the socket for write and returns to `kevent`. Parked readers of `big.bin` left `/` responsive. One eager reader of that file dropped `/` to about 24 req/s. See `bench.md`.
 
 ---
 
@@ -495,7 +496,7 @@ The size field is `response.body.size()`. Chunked file responses leave `body` em
 - [x] Count streamed bytes in the access log
 - [x] Benchmark your existing server — establish throughput and tail-latency baselines.
 - [x] Implement a kqueue-based event loop — non-blocking accept and read
-- [ ] Drive writes from `EVFILT_WRITE` instead of waiting in `poll` inside `send`
+- [x] Drive writes from `EVFILT_WRITE` instead of waiting in `poll` inside `send`. A parked `big.bin` client no longer blocks `/`. An eager reader of that file still occupies the one thread. See `bench.md`.
 - [ ] Add per-connection state machines — track partial requests, responses, and Keep-Alive.
 - [ ] Integrate streaming and backpressure — stop reading or writing when buffers reach safe limits.
 - [x] Compare architectures under load — same `wrk` commands on the thread pool and on kqueue. Idle keep-alive is fixed. Busy throughput is lower on the one thread. See `bench.md`.
@@ -521,14 +522,15 @@ main()
         ├── Socket::create/bind/listen/setNonBlocking
         ├── kqueue() + kevent()
         ├── acceptReady() → watch each client for read
-        └── readReady()
-              └── handleOneRequest()
-                    ├── HTTPParser::parse()     [one request; leftover bytes kept]
-                    ├── FileServer::openBinary() or in-memory 403/404
-                    ├── MimeResolver::getMime()
-                    ├── HTTPResponse::serializeHeaders() or serialize()
-                    ├── Socket::send()          [headers, chunks, or full error page]
-                    └── Logger::access()
+        ├── readReady() / writeReady() → progress()
+        └── handleOneRequest()
+              ├── HTTPParser::parse()     [one request; leftover bytes kept]
+              ├── FileServer::openBinary() or in-memory 403/404
+              ├── MimeResolver::getMime()
+              └── flush()
+                    ├── Socket::send()    [what the kernel accepts; tail kept on EAGAIN]
+                    ├── EVFILT_WRITE      [only while bytes remain]
+                    └── Logger::access()  [once the response has been accepted]
 ```
 
 On SIGINT, `onSigint` sets `g_stop` and calls `shutdown()` on the listening descriptor. That wakes `kevent`. `start()` clears `connections_`, closes the kqueue, closes the listener, and returns.

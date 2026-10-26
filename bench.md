@@ -216,4 +216,125 @@ Sixty-four connections fall back to about 3,200 req/s, and the 99th percentile b
 
 `file.jpeg` at 8 connections falls from 21,700 req/s and 549 MB/s to 3,600 req/s and about 92 MB/s. The 99th percentile shortens from 207 ms to 122 ms. One request is not slower. Fewer of them are in flight, because one thread reads and sends the file.
 
-The busy-server loss is that single thread, plus `poll` inside `send` holding it. Registering the socket for write with `EVFILT_WRITE`, and returning to `kevent` when the send buffer is full, is the next measurement to take with these same commands.
+The busy-server loss in these numbers is that single thread, plus `poll` inside `send` holding it. This section is the server before `EVFILT_WRITE`. The checks after that change are below.
+
+## Writes resume from `EVFILT_WRITE`
+
+`Socket::send` no longer waits in `poll`. A full kernel buffer leaves the unsent tail on the connection and registers `EVFILT_WRITE`. These checks were run the same day, against `127.0.0.1:8001`, with `LOG_LEVEL` unset. `big.bin` is the 3.1 GB file in `public/`. The four `wrk` rows above were not repeated after this change.
+
+### What we ran
+
+One client requested `big.bin`, read until it had the headers, and then stopped:
+
+```bash
+python3 - <<'PY'
+import socket, time
+s = socket.create_connection(("127.0.0.1", 8001))
+s.sendall(b"GET /big.bin HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+print("got", len(s.recv(1024)), "bytes, now not reading")
+time.sleep(60)
+PY
+```
+
+While that slept, and again while 30 such sockets were parked:
+
+```bash
+curl -w "waited %{time_total}s\n" -o /dev/null http://127.0.0.1:8001/
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w "curl $i waited %{time_total}s\n" http://127.0.0.1:8001/
+done
+wrk -t4 -c8 -d10s --latency http://127.0.0.1:8001/
+```
+
+A slow reader pulled 4 KB at a time. An eager reader downloaded the whole file in the background while `/` was requested on top of it:
+
+```bash
+curl -o /dev/null http://127.0.0.1:8001/big.bin &
+sleep 0.3
+for i in $(seq 1 5); do
+  curl -s -o /dev/null -w "curl $i waited %{time_total}s\n" http://127.0.0.1:8001/
+done
+wait
+
+curl -o /dev/null http://127.0.0.1:8001/big.bin &
+sleep 0.3
+wrk -t4 -c8 -d2s --latency http://127.0.0.1:8001/
+wait
+```
+
+### What we obtained
+
+The parked client’s first `recv` returned 111 bytes. That is the header block and none of the file:
+
+```text
+HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+Transfer-Encoding: chunked
+Connection: keep-alive
+```
+
+`GET /` during that sleep printed `waited 0.002968s` and received the 225-byte `index.html`. Twenty more page requests, with 30 of those downloads parked, waited 0.000243–0.000918 s.
+
+`wrk` for 10 seconds at 8 connections, still with the downloads parked:
+
+```text
+Running 10s test @ http://127.0.0.1:8001/
+  4 threads and 8 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.17ms    4.74ms  82.89ms   94.79%
+    Req/Sec     1.67k   580.54     3.84k    70.75%
+  Latency Distribution
+     50%    0.94ms
+     75%    1.73ms
+     90%    4.32ms
+     99%   23.48ms
+  66705 requests in 10.09s, 21.12MB read
+Requests/sec:   6612.30
+Transfer/sec:      2.09MB
+```
+
+The slow reader’s 40 calls started at 111 bytes and then returned 4096 bytes each, which is the size passed to `recv`. It stopped at 159,855 bytes. `big.bin` was not poured out.
+
+The eager download moved all 3167 MB in about 2 seconds, near 1240 MB/s. The five page requests issued across that transfer waited:
+
+```text
+curl 1 waited 0.433298s
+curl 2 waited 1.775340s
+curl 3 waited 0.182102s
+curl 4 waited 2.216977s
+curl 5 waited 0.000292s
+```
+
+The last of those is after `big.bin` had finished. `wrk` for 2 seconds during a second eager download:
+
+```text
+Running 2s test @ http://127.0.0.1:8001/
+  4 threads and 8 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   441.04ms  535.97ms   1.57s    81.82%
+    Req/Sec    12.91      7.05    20.00     63.64%
+  Latency Distribution
+     50%   91.06ms
+     75%  894.25ms
+     90%    1.23s
+     99%    1.57s
+  48 requests in 2.02s, 15.75KB read
+Requests/sec:     23.73
+Transfer/sec:      7.79KB
+```
+
+That `big.bin` client still finished, at about 1100 MB/s.
+
+| Situation | What `/` did |
+| --- | --- |
+| One parked `big.bin`, headers only | one request in 0.003 s |
+| 30 parked `big.bin` sockets | 20 requests in 0.2–0.9 ms; `wrk` 6,612 req/s, p50 0.94 ms, p99 23 ms |
+| Slow reader, 160 KB over ~20 s | file advanced only as `recv` was called |
+| One eager `big.bin`, ~1240 MB/s | page requests 0.18–2.2 s during the transfer, 0.0003 s after it |
+| `wrk` during that eager transfer | 24 req/s, p50 91 ms, p99 1.57 s, 48 requests in 2 s |
+
+### What we can infer
+
+A client that stops reading fills the kernel send buffer and then waits. `flush` hits `EAGAIN`, registers `EVFILT_WRITE`, and returns to `kevent`. That is why `/` stayed near the earlier kqueue rate (5,026 req/s with nothing else connected, 6,612 with 30 downloads parked). The parked sockets are entries in the queue. They are not the thread stuck in `poll`.
+
+A client that keeps reading drains the buffer about as fast as `flush` fills it, so `EAGAIN` is rare. The loop spent the ~2 second transfer inside `flush` and served `/` only in the gaps: 48 responses instead of the roughly thirteen thousand a 6,612 req/s pace would have completed in 2 seconds. The write registration removes the wait for a client who has stopped. It does not add a second thread for a client who has not.
